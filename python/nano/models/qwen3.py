@@ -68,6 +68,7 @@ class Attention(nn.Module):
     def forward(self, qkv: torch.Tensor) -> torch.Tensor:
         seq_len = qkv.shape[1]
         q, k, v = qkv.split([self.num_qo_heads * self.head_dim, self.num_kv_heads * self.head_dim, self.num_kv_heads * self.head_dim], dim=-1)
+        
         # Reshape to [seq_len, num_heads, head_dim] for RoPE and norms
         q = q.view(-1, self.num_qo_heads, self.head_dim).contiguous()
         k = k.view(-1, self.num_kv_heads, self.head_dim).contiguous()
@@ -78,25 +79,19 @@ class Attention(nn.Module):
         if self.k_norm is not None:
             self.k_norm.forward_inplace(k)
         
-        # Apply RoPE inplace - expects [num_tokens, num_heads, head_dim]
+        # Apply RoPE - expects [num_tokens, num_heads, head_dim]
         positions = torch.arange(seq_len, dtype=torch.int32, device=q.device)
-        self.rotary(positions, q, k)
+        q, k = self.rotary(positions, q, k)
         
         # TODO: use optimized attention kernel, i.e. flash_infer
         # Reshape for scaled_dot_product_attention: [batch, num_heads, seq_len, head_dim]
         q = q.view(-1, seq_len, self.num_qo_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
         k = k.view(-1, seq_len, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
         v = v.view(-1, seq_len, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
-        o = F.scaled_dot_product_attention(
-            q, 
-            k, 
-            v, 
-            is_causal=True, 
-            enable_gqa=True,
-        )
+        o = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
         
         # Reshape back to [seq_len, num_qo_heads * head_dim]
-        o = o.transpose(1, 2).reshape(-1, seq_len, self.num_qo_heads * self.head_dim)
+        o = o.permute(0, 2, 1, 3).reshape(-1, seq_len, self.num_qo_heads * self.head_dim)
         return o
     
 
