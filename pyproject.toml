@@ -25,7 +25,6 @@ dependencies = [
     "accelerate",
     "msgpack",
     "sgl_kernel>=0.3.17.post1",
-    "torch",
     "transformers>=4.56.0,<=4.57.3",
     "flashinfer-python>=0.5.3",
     "pyzmq",
@@ -48,6 +47,11 @@ dev = [
     "ruff>=0.11.0",
     "matplotlib>=3.10.5",
 ]
+
+[[tool.poetry.source]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+priority = "explicit"
 
 [tool.setuptools]
 include-package-data = true
