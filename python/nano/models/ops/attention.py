@@ -11,6 +11,7 @@ from minisgl.distributed import get_tp_info
 from minisgl.env import ENV
 from minisgl.utils import divide_even
 from minisgl.utils.logger import init_logger
+from minisgl.core import Req
 
 if TYPE_CHECKING:
     from flashinfer import (

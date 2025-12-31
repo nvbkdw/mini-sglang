@@ -47,7 +47,7 @@ class Req:
         
     def append_host(self, next_token: torch.Tensor) -> None:
         # append new token to the token buffer on host
-        self.host_ids = torch.cat([self.host_ids, next_token])
+        self.host_ids = torch.cat([self.host_ids, next_token.unsqueeze(0)])
         
     def can_decode(self) -> bool:
         return self.remain_len > 0

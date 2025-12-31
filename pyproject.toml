@@ -34,6 +34,7 @@ dependencies = [
     "openai",
     "apache-tvm-ffi>=0.1.4",
     "nvidia-cutlass-dsl==4.3.1",
+    "pytest>=9.0.2",
 ]
 
 [project.optional-dependencies]

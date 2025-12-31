@@ -66,7 +66,7 @@ class Attention(nn.Module):
         )
 
     def forward(self, qkv: torch.Tensor) -> torch.Tensor:
-        seq_len = qkv.shape[1]
+        batch_size, seq_len = qkv.shape[:2]
         q, k, v = qkv.split([self.num_qo_heads * self.head_dim, self.num_kv_heads * self.head_dim, self.num_kv_heads * self.head_dim], dim=-1)
         
         # Reshape to [seq_len, num_heads, head_dim] for RoPE and norms
@@ -79,9 +79,9 @@ class Attention(nn.Module):
         if self.k_norm is not None:
             self.k_norm.forward_inplace(k)
         
-        # Apply RoPE - expects [num_tokens, num_heads, head_dim]
-        positions = torch.arange(seq_len, dtype=torch.int32, device=q.device)
-        q, k = self.rotary(positions, q, k)
+        # Apply RoPE inplace - expects [num_tokens, num_heads, head_dim]
+        positions = torch.arange(seq_len, dtype=torch.int32, device=q.device).repeat(batch_size, 1) # [batch_size, seq_len]
+        self.rotary(positions, q, k)
         
         # TODO: use optimized attention kernel, i.e. flash_infer
         # Reshape for scaled_dot_product_attention: [batch, num_heads, seq_len, head_dim]
