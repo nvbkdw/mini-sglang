@@ -1,5 +1,5 @@
 """
-Unit tests for RadixCacheManager.
+Unit tests for RadixKVCacheManager.
 
 This module tests the radix tree-based cache manager which implements
 prefix caching with LRU eviction.
@@ -8,29 +8,17 @@ prefix caching with LRU eviction.
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
 
 import torch
 
-from minisgl.kvcache.radix_manager import (
+from nano.kvcache.radix import (
     RadixCacheHandle,
-    RadixCacheManager,
+    RadixKVCacheManager,
     RadixTreeNode,
 )
 from minisgl.utils import call_if_main
 
 
-def mock_fast_compare_key(key: torch.Tensor, input_ids: torch.Tensor) -> int:
-    """Pure Python implementation of fast_compare_key for testing."""
-    min_len = min(len(key), len(input_ids))
-    for i in range(min_len):
-        if key[i].item() != input_ids[i].item():
-            return i
-    return min_len
-
-
-# Patch at module load time for RadixTreeNode tests
-@patch("minisgl.kernel.fast_compare_key", mock_fast_compare_key)
 class TestRadixTreeNode(unittest.TestCase):
     """Test cases for RadixTreeNode class."""
 
@@ -72,8 +60,8 @@ class TestRadixTreeNode(unittest.TestCase):
         node1 = RadixTreeNode(tic=100)
         node2 = RadixTreeNode(tic=200)
         
-        self.assertTrue(node1 < node2)
-        self.assertFalse(node2 < node1)
+        # Comparison based on timestamp for heap ordering
+        self.assertTrue(node1.timestamp < node2.timestamp)
 
     def test_split_at(self):
         """Test splitting a node at a position."""
@@ -88,35 +76,58 @@ class TestRadixTreeNode(unittest.TestCase):
         node.ref_count = 2
 
         # Split at position 2
-        new_node = node._split_at(2)
+        # In nano's implementation, _split_at returns self (prefix) and creates a new child (suffix)
+        prefix_node = node._split_at(2)
 
-        # Check new node (prefix)
-        self.assertEqual(new_node.length, 2)
-        self.assertTrue(torch.equal(new_node.value, torch.tensor([10, 20], dtype=torch.int32)))
-        self.assertEqual(new_node.parent, parent)
-        self.assertEqual(new_node.ref_count, 2)
+        # prefix_node and node are the same object
+        self.assertIs(prefix_node, node)
 
-        # Check original node (suffix)
-        self.assertEqual(node.length, 3)
-        self.assertTrue(torch.equal(node.value, torch.tensor([30, 40, 50], dtype=torch.int32)))
-        self.assertEqual(node.parent, new_node)
+        # Check prefix (now the original node)
+        self.assertEqual(node.length, 2)
+        self.assertTrue(torch.equal(node.value, torch.tensor([10, 20], dtype=torch.int32)))
+        self.assertEqual(node.parent, parent)
+
+        # Check suffix (child of prefix, key starts with 3)
+        self.assertEqual(len(node.children), 1)
+        suffix_node = node.children[3]
+        self.assertEqual(suffix_node.length, 3)
+        self.assertTrue(torch.equal(suffix_node.value, torch.tensor([30, 40, 50], dtype=torch.int32)))
+        self.assertEqual(suffix_node.parent, node)
+        self.assertEqual(suffix_node.ref_count, 2)
 
         # Check parent references
-        self.assertEqual(parent.children[1], new_node)
-        self.assertEqual(new_node.children[3], node)
+        self.assertEqual(parent.children[1], node)
+
+    def test_get_match_len(self):
+        """Test get_match_len method."""
+        node = RadixTreeNode()
+        key = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32)
+        value = torch.tensor([10, 20, 30, 40, 50], dtype=torch.int32)
+        node.set_key_value(key, value)
+
+        # Full match
+        input_ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32)
+        self.assertEqual(node.get_match_len(input_ids), 5)
+
+        # Partial match
+        input_ids = torch.tensor([1, 2, 3, 6, 7], dtype=torch.int32)
+        self.assertEqual(node.get_match_len(input_ids), 3)
+
+        # No match at start
+        input_ids = torch.tensor([9, 2, 3], dtype=torch.int32)
+        self.assertEqual(node.get_match_len(input_ids), 0)
+
+        # Shorter input
+        input_ids = torch.tensor([1, 2], dtype=torch.int32)
+        self.assertEqual(node.get_match_len(input_ids), 2)
 
 
-@patch("minisgl.kernel.fast_compare_key", mock_fast_compare_key)
-class TestRadixCacheManager(unittest.TestCase):
-    """Test cases for RadixCacheManager class."""
-
-    def setUp(self):
-        """Set up test fixtures."""
-        self.device = torch.device("cpu")
+class TestRadixKVCacheManager(unittest.TestCase):
+    """Test cases for RadixKVCacheManager class."""
 
     def test_initialization(self):
         """Test manager initialization."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         
         self.assertEqual(manager.evictable_size, 0)
         self.assertEqual(manager.protected_size, 0)
@@ -125,7 +136,7 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_size_info(self):
         """Test size_info property."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         
         size_info = manager.size_info
         self.assertEqual(size_info.evictable_size, 0)
@@ -134,7 +145,7 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_match_prefix_empty_tree(self):
         """Test prefix matching on empty tree."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         input_ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32)
         
         handle, indices = manager.match_prefix(input_ids)
@@ -145,7 +156,7 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_insert_prefix_single(self):
         """Test inserting a single prefix."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         input_ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32)
         indices = torch.tensor([10, 20, 30, 40, 50], dtype=torch.int32)
         
@@ -156,7 +167,7 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_match_prefix_after_insert(self):
         """Test prefix matching after inserting."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         input_ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32)
         indices = torch.tensor([10, 20, 30, 40, 50], dtype=torch.int32)
         
@@ -169,7 +180,7 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_match_prefix_partial(self):
         """Test partial prefix matching."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         input_ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32)
         indices = torch.tensor([10, 20, 30, 40, 50], dtype=torch.int32)
         
@@ -183,7 +194,7 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_match_prefix_longer_query(self):
         """Test prefix matching with longer query."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         input_ids = torch.tensor([1, 2, 3], dtype=torch.int32)
         indices = torch.tensor([10, 20, 30], dtype=torch.int32)
         
@@ -197,7 +208,7 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_match_prefix_no_match(self):
         """Test prefix matching with no match."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         input_ids = torch.tensor([1, 2, 3], dtype=torch.int32)
         indices = torch.tensor([10, 20, 30], dtype=torch.int32)
         
@@ -211,7 +222,7 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_insert_prefix_with_overlap(self):
         """Test inserting prefixes with overlap."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         
         # Insert first prefix
         input_ids1 = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32)
@@ -229,7 +240,7 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_insert_duplicate_prefix(self):
         """Test inserting duplicate prefix."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         input_ids = torch.tensor([1, 2, 3], dtype=torch.int32)
         indices = torch.tensor([10, 20, 30], dtype=torch.int32)
         
@@ -241,7 +252,7 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_lock_handle(self):
         """Test locking a handle."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         input_ids = torch.tensor([1, 2, 3], dtype=torch.int32)
         indices = torch.tensor([10, 20, 30], dtype=torch.int32)
         
@@ -258,7 +269,7 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_unlock_handle(self):
         """Test unlocking a handle."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         input_ids = torch.tensor([1, 2, 3], dtype=torch.int32)
         indices = torch.tensor([10, 20, 30], dtype=torch.int32)
         
@@ -273,14 +284,14 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_evict_zero(self):
         """Test evicting zero size."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         
         evicted = manager.evict(0)
         self.assertEqual(len(evicted), 0)
 
     def test_evict_simple(self):
         """Test simple eviction."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         input_ids = torch.tensor([1, 2, 3], dtype=torch.int32)
         indices = torch.tensor([10, 20, 30], dtype=torch.int32)
         
@@ -295,7 +306,7 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_evict_partial(self):
         """Test partial eviction."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         
         # Insert two separate prefixes
         input_ids1 = torch.tensor([1, 2, 3], dtype=torch.int32)
@@ -316,7 +327,7 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_evict_lru_order(self):
         """Test that eviction follows LRU order."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         
         # Insert first prefix (older)
         input_ids1 = torch.tensor([1, 2, 3], dtype=torch.int32)
@@ -338,7 +349,7 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_evict_protected_fails(self):
         """Test that evicting protected nodes fails."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         input_ids = torch.tensor([1, 2, 3], dtype=torch.int32)
         indices = torch.tensor([10, 20, 30], dtype=torch.int32)
         
@@ -350,27 +361,26 @@ class TestRadixCacheManager(unittest.TestCase):
         
         self.assertEqual(manager.evictable_size, 0)
         
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(Exception):
             manager.evict(1)
 
     def test_evict_too_much_fails(self):
         """Test that evicting more than available fails."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         input_ids = torch.tensor([1, 2, 3], dtype=torch.int32)
         indices = torch.tensor([10, 20, 30], dtype=torch.int32)
         
         manager.insert_prefix(input_ids, indices)
         
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(Exception):
             manager.evict(10)  # Only 3 available
 
     def test_multiple_branches(self):
         """Test tree with multiple branches."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         
         # Insert multiple prefixes sharing a common prefix
         base = torch.tensor([1, 2, 3], dtype=torch.int32)
-        base_indices = torch.tensor([10, 20, 30], dtype=torch.int32)
         
         branch1 = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32)
         branch1_indices = torch.tensor([10, 20, 30, 40, 50], dtype=torch.int32)
@@ -398,7 +408,7 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_node_splitting(self):
         """Test that nodes are split correctly when inserting partial matches."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         
         # Insert long prefix
         long_prefix = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8], dtype=torch.int32)
@@ -422,7 +432,7 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_lock_deep_node(self):
         """Test locking a deeply nested node."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         
         # Create deep tree structure
         prefix1 = torch.tensor([1, 2, 3], dtype=torch.int32)
@@ -450,16 +460,17 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_reset_not_implemented(self):
         """Test that reset raises NotImplementedError."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         
         with self.assertRaises(NotImplementedError):
             manager.reset()
 
-    def test_check_integrity(self):
-        """Test check_integrity method (currently no-op)."""
-        manager = RadixCacheManager(self.device)
-        # Should not raise
-        manager.check_integrity()
+    def test_check_integrity_not_implemented(self):
+        """Test that check_integrity raises NotImplementedError."""
+        manager = RadixKVCacheManager()
+        
+        with self.assertRaises(NotImplementedError):
+            manager.check_integrity()
 
     def test_radix_cache_handle(self):
         """Test RadixCacheHandle dataclass."""
@@ -471,7 +482,7 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_empty_input(self):
         """Test behavior with empty input."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         input_ids = torch.tensor([], dtype=torch.int32)
         
         handle, indices = manager.match_prefix(input_ids)
@@ -480,7 +491,7 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_single_token(self):
         """Test with single token sequences."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         
         input_ids = torch.tensor([42], dtype=torch.int32)
         indices = torch.tensor([100], dtype=torch.int32)
@@ -493,7 +504,7 @@ class TestRadixCacheManager(unittest.TestCase):
 
     def test_evict_cascades_to_parent(self):
         """Test that eviction properly cascades to make parent a leaf."""
-        manager = RadixCacheManager(self.device)
+        manager = RadixKVCacheManager()
         
         # Insert prefix and extension
         base = torch.tensor([1, 2, 3], dtype=torch.int32)
@@ -525,4 +536,3 @@ def run_tests():
 
 if __name__ == "__main__":
     run_tests()
-

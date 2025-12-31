@@ -73,7 +73,10 @@ class SizeInfo(NamedTuple):
     def total_size(self) -> int:
         return self.evictable_size + self.protected_size
 
-        
+@dataclass(frozen=True)
+class CacheHandle(ABC):
+    cached_len: int
+    
 class KVCacheManager(ABC):
     """
     Cache manager interface for KVCache.
@@ -150,4 +153,5 @@ class KVCacheManager(ABC):
     def check_integrity(self) -> None:
         """Check the integrity of the cache. Raise an error if the cache is corrupted."""
         
+
     
