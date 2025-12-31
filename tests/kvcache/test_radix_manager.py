@@ -29,6 +29,8 @@ def mock_fast_compare_key(key: torch.Tensor, input_ids: torch.Tensor) -> int:
     return min_len
 
 
+# Patch at module load time for RadixTreeNode tests
+@patch("minisgl.kernel.fast_compare_key", mock_fast_compare_key)
 class TestRadixTreeNode(unittest.TestCase):
     """Test cases for RadixTreeNode class."""
 
@@ -104,21 +106,13 @@ class TestRadixTreeNode(unittest.TestCase):
         self.assertEqual(new_node.children[3], node)
 
 
+@patch("minisgl.kernel.fast_compare_key", mock_fast_compare_key)
 class TestRadixCacheManager(unittest.TestCase):
     """Test cases for RadixCacheManager class."""
 
     def setUp(self):
         """Set up test fixtures."""
         self.device = torch.device("cpu")
-        self.patcher = patch(
-            "minisgl.kvcache.radix_manager.RadixTreeNode.get_match_len",
-            side_effect=lambda self, input_ids: mock_fast_compare_key(self._key, input_ids),
-        )
-        self.patcher.start()
-
-    def tearDown(self):
-        """Clean up after tests."""
-        self.patcher.stop()
 
     def test_initialization(self):
         """Test manager initialization."""
