@@ -6,6 +6,8 @@ import torch.cuda.nvtx as nvtx
 from nano.models.config import ModelConfig, RotaryConfig
 from nano.models.ops.rotary import get_rope
 
+from nano.core import Batch
+
 
 class RMSNorm(nn.Module):
     def __init__(self, size: int, eps: float) -> None:
@@ -97,11 +99,10 @@ class Attention(nn.Module):
 
         
 class Qwen3Attn(nn.Module):
-    def __init__(self, config: ModelConfig, layer_id: int, backend: str = "PyTorchBackend", *, has_attn_bias: bool = False, has_qk_norm: bool = False):
+    def __init__(self, config: ModelConfig, layer_id: int, *, has_attn_bias: bool = False, has_qk_norm: bool = False):
         super().__init__()
         GQA_ratio = config.num_qo_heads // config.num_kv_heads
         output_size = (GQA_ratio + 2) * config.num_kv_heads * config.head_dim
-        self.backend = backend
         self.qkv_proj = nn.Linear(config.hidden_size, output_size, bias=False)
         self.has_qk_norm = has_qk_norm
         if has_qk_norm:
@@ -110,26 +111,53 @@ class Qwen3Attn(nn.Module):
         else:
             self.q_norm = None
             self.k_norm = None
-        
-        # TODO: integrate attention kernel
-        if backend == "FlashInferBackend":
-            from nano.models.ops.attention import FlashInferBackend
-            self.attn = FlashInferBackend(config, layer_id)
-        else:
-            self.attn = Attention(
-                num_qo_heads=config.num_qo_heads,
-                num_kv_heads=config.num_kv_heads,
-                head_dim=config.head_dim,
-                rotary_config=config.rotary_config,
-                q_norm=self.q_norm,
-                k_norm=self.k_norm,
-            )
+        self.layer_id = layer_id
+        # TODO: integrate attention kernel, remove pytorch attention
+        # self.attn = Attention(
+        #     num_qo_heads=config.num_qo_heads,
+        #     num_kv_heads=config.num_kv_heads,
+        #     head_dim=config.head_dim,
+        #     rotary_config=config.rotary_config,
+        #     q_norm=self.q_norm,
+        #     k_norm=self.k_norm,
+        # )
         self.o_proj = nn.Linear(config.num_qo_heads * config.head_dim, config.hidden_size, bias=False)
         
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, batch: Batch | None = None) -> torch.Tensor:
+        assert batch is not None
+        # TODO: use attention kernel from batch.attn_metadata
         qkv = self.qkv_proj(x)
         del x
-        o = self.attn(qkv)
+        # pytorch attention
+        # o = self.attn(qkv)
+
+        batch_size, seq_len = qkv.shape[:2]
+        q, k, v = qkv.split([self.num_qo_heads * self.head_dim, self.num_kv_heads * self.head_dim, self.num_kv_heads * self.head_dim], dim=-1)
+        
+        # Reshape to [seq_len, num_heads, head_dim] for RoPE and norms
+        q = q.view(-1, self.num_qo_heads, self.head_dim).contiguous()
+        k = k.view(-1, self.num_kv_heads, self.head_dim).contiguous()
+        v = v.view(-1, self.num_kv_heads, self.head_dim).contiguous()
+        
+        if self.q_norm is not None:
+            self.q_norm.forward_inplace(q)
+        if self.k_norm is not None:
+            self.k_norm.forward_inplace(k)
+        
+        # Apply RoPE inplace - expects [num_tokens, num_heads, head_dim]
+        positions = torch.arange(seq_len, dtype=torch.int32, device=q.device).repeat(batch_size, 1) # [batch_size, seq_len]
+        self.rotary(positions, q, k)
+        
+        # TODO: use optimized attention kernel, i.e. flash_infer
+        # Reshape for scaled_dot_product_attention: [batch, seq_len, num_heads, head_dim]
+        q = q.view(-1, seq_len, self.num_qo_heads, self.head_dim).contiguous()
+        k = k.view(-1, seq_len, self.num_kv_heads, self.head_dim).contiguous()
+        v = v.view(-1, seq_len, self.num_kv_heads, self.head_dim).contiguous()
+
+        # call attention backend
+        
+        o = batch.attn_backend.forward(q, k, v, self.layer_id, batch)
+        
         return self.o_proj(o)
 
         
@@ -171,10 +199,11 @@ class Qwen3DecoderLayer(nn.Module):
             eps=config.rms_norm_eps,
         )
 
-    def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None, batch: Batch | None = None) -> torch.Tensor:
         x, residual = self.input_layernorm(x, residual)
         with nvtx.range(f"MHA_{self._layer_id}"):
-            x = self.self_attn.forward(x)
+            x = self.self_attn.forward(x, batch)
+            
         x, residual = self.post_attention_layernorm(x, residual)
         with nvtx.range(f"MLP_{self._layer_id}"):
             x = self.mlp(x)
@@ -193,13 +222,13 @@ class Qwen3Model(nn.Module):
             eps=config.rms_norm_eps,
         )
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, batch: Batch | None = None) -> torch.Tensor:
         with nvtx.range("Embedding"):
             x = self.embed_tokens(input_ids)
         residual: torch.Tensor | None = None
         for layer in self.layers:
             with nvtx.range(f"Layer_{layer._layer_id}"):
-                x, residual = layer(x, residual)
+                x, residual = layer(x, residual, batch)
         return self.norm(x, residual)[0]
 
 class Qwen3ForCausalLM(nn.Module):
@@ -207,8 +236,8 @@ class Qwen3ForCausalLM(nn.Module):
         super().__init__()
         self.model = Qwen3Model(config)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.model.forward(input_ids)
+    def forward(self, input_ids: torch.Tensor, batch: Batch | None = None) -> torch.Tensor:
+        x = self.model.forward(input_ids, batch)
         # lm_head
         with nvtx.range("LMHead"):
             logits = F.linear(x, self.model.embed_tokens.weight, None)

@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import torch
+from abc import ABC, abstractmethod
 from typing import List, Literal
-from nano.models.ops.attention import BaseAttnMetadata
 
 @dataclass
 class SamplingParams:
@@ -27,11 +27,16 @@ class Req:
         # assert input_ids.is_cpu
         # Ensure input_ids is 1D [seq_len] for storage
         self.host_ids = input_ids.squeeze(0) if input_ids.dim() > 1 else input_ids
+        # cached tokens
+        self.cached_len = 0
         # total len to generate
         self.device_len = self.host_ids.shape[0]
         # max len to generate
         self.max_device_len = len(input_ids) + output_len
         assert 0 < self.device_len <= self.max_device_len
+        
+        #  row index in page table
+        self.table_idx = -1
         
     @property
     def remain_len(self) -> int:
@@ -41,8 +46,10 @@ class Req:
     def extend_len(self) -> int:
         return self.device_len
     
-    def complete_one(self) -> None:
+    def complete_one(self, next_token: torch.Tensor) -> None:
         # complete one step, either prefill or decode
+        self.append_host(next_token)
+        self.cached_len = self.device_len
         self.device_len += 1
         
     def append_host(self, next_token: torch.Tensor) -> None:
@@ -68,7 +75,9 @@ class Batch:
         self.padded_reqs: List[Req] = [] # may contain some dummy reqs for padding
         self.phase: Literal["prefill", "decode"] = phase
         # this fields should be set by attention backend
-        self.attn_metadata: BaseAttnMetadata
+        self.attn_backend: BaseAttnBackend
+        self.load_indices: torch.Tensor
+        self.write_indices: torch.Tensor
         
     @property
     def is_prefill(self) -> bool:
@@ -85,3 +94,17 @@ class Batch:
     @property
     def padded_size(self) -> int:
         return len(self.padded_reqs)
+
+@dataclass
+class BaseAttnMetadata:
+    positions: torch.Tensor
+
+class BaseAttnBackend(ABC):
+    @abstractmethod
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
+    ) -> torch.Tensor: ...
+
+    @abstractmethod
+    def prepare_metadata(self, batch: Batch) -> None: ...
+ 

@@ -200,6 +200,7 @@ class FlashInferBackend(BaseAttnBackend):
 
         device = self.device
         seq_len_cpu = torch.tensor(seqlens_k, **cpu_kwargs)
+        # The accumulative indptr of the paged kv cache
         cu_seqlens_k_cpu = torch.tensor([0] + seqlens_k, **cpu_kwargs).cumsum_(dim=0)
         if max_seqlen_q == 1:  # decode with all extend_len = 1
             cu_seqlens_q_cpu = torch.arange(0, padded_size + 1, **cpu_kwargs)
