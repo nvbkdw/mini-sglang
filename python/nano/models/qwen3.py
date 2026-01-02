@@ -101,6 +101,7 @@ class Attention(nn.Module):
 class Qwen3Attn(nn.Module):
     def __init__(self, config: ModelConfig, layer_id: int, *, has_attn_bias: bool = False, has_qk_norm: bool = False):
         super().__init__()
+        self.config = config
         GQA_ratio = config.num_qo_heads // config.num_kv_heads
         output_size = (GQA_ratio + 2) * config.num_kv_heads * config.head_dim
         self.qkv_proj = nn.Linear(config.hidden_size, output_size, bias=False)
@@ -112,6 +113,13 @@ class Qwen3Attn(nn.Module):
             self.q_norm = None
             self.k_norm = None
         self.layer_id = layer_id
+        self.rotary = get_rope(
+            head_dim=config.head_dim,
+            rotary_dim=config.head_dim,
+            max_position=config.rotary_config.max_position,
+            base=config.rotary_config.base,
+            rope_scaling=tuple(config.rotary_config.scaling.items()) if config.rotary_config.scaling else None,
+        )
         # TODO: integrate attention kernel, remove pytorch attention
         # self.attn = Attention(
         #     num_qo_heads=config.num_qo_heads,
@@ -121,7 +129,12 @@ class Qwen3Attn(nn.Module):
         #     q_norm=self.q_norm,
         #     k_norm=self.k_norm,
         # )
-        self.o_proj = nn.Linear(config.num_qo_heads * config.head_dim, config.hidden_size, bias=False)
+        self.qo_attn_dim = config.num_qo_heads * config.head_dim
+        self.o_proj = nn.Linear(
+            config.num_qo_heads * config.head_dim, 
+            config.hidden_size, 
+            bias=False
+        )
         
     def forward(self, x: torch.Tensor, batch: Batch | None = None) -> torch.Tensor:
         assert batch is not None
@@ -132,12 +145,16 @@ class Qwen3Attn(nn.Module):
         # o = self.attn(qkv)
 
         batch_size, seq_len = qkv.shape[:2]
-        q, k, v = qkv.split([self.num_qo_heads * self.head_dim, self.num_kv_heads * self.head_dim, self.num_kv_heads * self.head_dim], dim=-1)
+        q, k, v = qkv.split([
+            self.config.num_qo_heads * self.config.head_dim, 
+            self.config.num_kv_heads * self.config.head_dim, 
+            self.config.num_kv_heads * self.config.head_dim
+        ], dim=-1)
         
         # Reshape to [seq_len, num_heads, head_dim] for RoPE and norms
-        q = q.view(-1, self.num_qo_heads, self.head_dim).contiguous()
-        k = k.view(-1, self.num_kv_heads, self.head_dim).contiguous()
-        v = v.view(-1, self.num_kv_heads, self.head_dim).contiguous()
+        q = q.view(-1, self.config.num_qo_heads, self.config.head_dim).contiguous()
+        k = k.view(-1, self.config.num_kv_heads, self.config.head_dim).contiguous()
+        v = v.view(-1, self.config.num_kv_heads, self.config.head_dim).contiguous()
         
         if self.q_norm is not None:
             self.q_norm.forward_inplace(q)
@@ -145,19 +162,23 @@ class Qwen3Attn(nn.Module):
             self.k_norm.forward_inplace(k)
         
         # Apply RoPE inplace - expects [num_tokens, num_heads, head_dim]
-        positions = torch.arange(seq_len, dtype=torch.int32, device=q.device).repeat(batch_size, 1) # [batch_size, seq_len]
-        self.rotary(positions, q, k)
+        if self.rotary:
+            attn_metadata = batch.attn_backend.get_attn_metadata(batch)
+            positions = attn_metadata.positions
+            q, k = self.rotary(positions, q, k)
+            # positions = torch.arange(seq_len, dtype=torch.int32, device=q.device).repeat(batch_size, 1) # [batch_size, seq_len]
+            # self.rotary(positions, q, k)
         
         # TODO: use optimized attention kernel, i.e. flash_infer
         # Reshape for scaled_dot_product_attention: [batch, seq_len, num_heads, head_dim]
-        q = q.view(-1, seq_len, self.num_qo_heads, self.head_dim).contiguous()
-        k = k.view(-1, seq_len, self.num_kv_heads, self.head_dim).contiguous()
-        v = v.view(-1, seq_len, self.num_kv_heads, self.head_dim).contiguous()
+        q = q.view(-1, self.config.num_qo_heads, self.config.head_dim).contiguous()
+        k = k.view(-1, self.config.num_kv_heads, self.config.head_dim).contiguous()
+        v = v.view(-1, self.config.num_kv_heads, self.config.head_dim).contiguous()
 
         # call attention backend
-        
+
         o = batch.attn_backend.forward(q, k, v, self.layer_id, batch)
-        
+        o = o.view(-1, self.qo_attn_dim)
         return self.o_proj(o)
 
         

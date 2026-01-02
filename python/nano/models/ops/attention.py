@@ -23,7 +23,7 @@ def _next_power_of_2(n: int) -> int:
 
 def make_positions(device: torch.device, reqs: List[Req]) -> torch.Tensor:
     needed_size = sum(req.extend_len for req in reqs)
-    indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
+    indices_host = torch.empty(needed_size, dtype=torch.int32)
     offset = 0
     for req in reqs:
         length = req.extend_len
@@ -86,6 +86,11 @@ class HybridBackend(BaseAttnBackend):
         self.prefill_backend = prefill_backend
         self.decode_backend = decode_backend
 
+        
+    def get_attn_metadata(self, batch: Batch) -> FIMetadata:
+        backend = self.prefill_backend if batch.is_prefill else self.decode_backend
+        return backend.attn_metadata
+
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
     ) -> torch.Tensor:
@@ -138,7 +143,7 @@ class FlashInferBackend(BaseAttnBackend):
         self.qo_head_local = self.config.num_qo_heads
         self.kv_head_local = self.config.num_kv_heads
 
-        self.cached_ones_cpu: torch.Tensor = torch.tensor([], dtype=torch.int32, pin_memory=True)
+        self.cached_ones_cpu: torch.Tensor = torch.tensor([], dtype=torch.int32)
         # for cuda graph
         self.page_table = page_table
 
@@ -192,7 +197,7 @@ class FlashInferBackend(BaseAttnBackend):
             return self.cached_ones_cpu[:bs]
         # padding to next pow of 2
         next_len = _next_power_of_2(bs)
-        self.cached_ones_cpu = torch.ones(next_len, dtype=torch.int32, pin_memory=True)
+        self.cached_ones_cpu = torch.ones(next_len, dtype=torch.int32, device='cpu')
         return self.cached_ones_cpu[:bs]
 
     def forward(
@@ -201,7 +206,11 @@ class FlashInferBackend(BaseAttnBackend):
         metadata = self.attn_metadata
         assert isinstance(metadata, FIMetadata)
         self._initialize_metadata_once(metadata)
-        self.kvcache.store_kv(k, v, batch.write_indices, layer_id)
+        # append recomputed key and value to kvcache
+        # NOTE: batch.load_indices are indices into the page_table, not actual page numbers.
+        # We need to look up the actual page indices from the page_table.
+        page_indices = self.page_table.view(-1)[batch.load_indices]
+        self.kvcache.store_kv(k, v, page_indices, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
         return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
 
@@ -214,7 +223,7 @@ class FlashInferBackend(BaseAttnBackend):
         seqlens_k = [req.device_len for req in reqs]
         cached_lens = [req.cached_len for req in reqs]
         max_seqlen_q = max(seqlens_q)
-        cpu_kwargs = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
+        cpu_kwargs = {"device": "cpu", "dtype": torch.int32}
 
         device = self.device
         seq_len_cpu = torch.tensor(seqlens_k, **cpu_kwargs)
@@ -241,3 +250,6 @@ class FlashInferBackend(BaseAttnBackend):
             dtype=self.kvcache.dtype,
             wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
         )
+
+    def get_attn_metadata(self, batch: Batch) -> FIMetadata:
+        return self.attn_metadata

@@ -322,7 +322,7 @@ ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
             req.complete_one()
 
         next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
-        next_tokens_cpu = torch.empty_like(next_tokens_gpu, device="cpu", pin_memory=True)
+        next_tokens_cpu = torch.empty_like(next_tokens_gpu, device="cpu")
         next_tokens_cpu.copy_(next_tokens_gpu, non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)

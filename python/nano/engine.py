@@ -236,18 +236,15 @@ class Engine:
                 req.complete_one(next_tokens[j])
             
             # prepare next batch for decode
+            input_batch.phase = "decode"
             input_batch = self._prepare_batch(input_batch)
                 
             # end of sequence
             # TODO: allow batch to have different lengths
-            if (next_tokens[:] == self.tokenizer.eos_token_id).all():
+            if (next_tokens[:] == self.tokenizer.eos_token_id).any():
                 print(f"End of sequence at token {i}")
                 break
             
-            # Append next tokens to each request's host_ids
-            for j, req in enumerate(input_batch.reqs):
-                req.append_host(next_tokens[j])
-
         # free resources for finished request batch
         for req in input_batch.reqs:
             self.cache_manager.free_pages(req)
@@ -313,19 +310,25 @@ class Engine:
         # allocate new pages for the batch
         out_loc = self.cache_manager.allocate(needed_size)
         
-        # compute indices for loading token IDs from page table
+        # indices of token to prefill 
         batch.load_indices = _make_2d_indices(
             self.page_table,
             [(r.table_idx, r.cached_len, r.device_len) for r in batch.reqs]
         )
+        # indices of new token to generate
         batch.write_indices = _make_2d_indices(
             self.page_table,
             [(r.table_idx, r.device_len, r.device_len + 1) for r in batch.reqs]
         )
-        self.page_table.view(-1)[batch.write_indices] = out_loc
+        self.page_table.view(-1)[batch.load_indices] = torch.tensor(out_loc, device=self.device, dtype=torch.int32)
         
         # prepare attention metadata
         batch.attn_backend.prepare_metadata(batch)
+        batch.input_ids = torch.concat([
+            torch.tensor(req.host_ids[req.cached_len:req.device_len]) for req in batch.reqs
+            ],
+            dim=0,
+        )
         
         return batch 
 
@@ -335,13 +338,15 @@ class Engine:
     
     def forward(self, batch: Batch) -> torch.Tensor:
         # conduct text completion
-        # TODO: use page table to manage the model inputs
         # Stack requests: each host_ids is [seq_len], stack to get [batch, seq_len]
-        model_inputs = torch.stack([req.host_ids for req in batch.reqs], dim=0)
-        model_inputs = model_inputs.to(self.device).contiguous()
-        logits = self.model(model_inputs)
+        # model_inputs = torch.stack([req.host_ids[-req.extend_len:] for req in batch.reqs], dim=0)
+        # model_inputs = model_inputs.to(self.device).contiguous()
+        model_inputs = batch.input_ids
+        logits = self.model(model_inputs, batch)
+        metadata = batch.attn_backend.get_attn_metadata(batch)
         # Only use the last position's logits for next token prediction
-        last_logits = logits[:, -1, :]  # [batch, vocab_size]
+        last_position_indices = metadata.cu_seqlens_q_cpu[1:] - 1
+        last_logits = logits[last_position_indices, :]  # [batch, vocab_size]
         # Sample next token
         next_tokens = self.sampler.sample(last_logits).to(torch.int32)  # [batch, 1]
         return next_tokens

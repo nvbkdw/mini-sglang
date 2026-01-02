@@ -28,7 +28,7 @@ class Req:
         # Ensure input_ids is 1D [seq_len] for storage
         self.host_ids = input_ids.squeeze(0) if input_ids.dim() > 1 else input_ids
         # cached tokens
-        self.cached_len = 0
+        self._cached_len = 0
         # total len to generate
         self.device_len = self.host_ids.shape[0]
         # max len to generate
@@ -44,12 +44,16 @@ class Req:
     
     @property
     def extend_len(self) -> int:
-        return self.device_len
+        return self.device_len - self._cached_len
+    
+    @property
+    def cached_len(self) -> int:
+        return self._cached_len
     
     def complete_one(self, next_token: torch.Tensor) -> None:
         # complete one step, either prefill or decode
         self.append_host(next_token)
-        self.cached_len = self.device_len
+        self._cached_len = self.device_len
         self.device_len += 1
         
     def append_host(self, next_token: torch.Tensor) -> None:
@@ -76,8 +80,14 @@ class Batch:
         self.phase: Literal["prefill", "decode"] = phase
         # this fields should be set by attention backend
         self.attn_backend: BaseAttnBackend
+        
+        # input token ids for prefill
+        self.input_ids: torch.Tensor
+        # indices of token to prefill 
         self.load_indices: torch.Tensor
+        # indices of new token to generate
         self.write_indices: torch.Tensor
+        
         
     @property
     def is_prefill(self) -> bool:
@@ -107,4 +117,6 @@ class BaseAttnBackend(ABC):
 
     @abstractmethod
     def prepare_metadata(self, batch: Batch) -> None: ...
- 
+    
+    @abstractmethod
+    def get_attn_metadata(self, batch: Batch) -> BaseAttnMetadata: ...
